@@ -1,0 +1,185 @@
+name: Provisioning compte Keycloak PFC
+
+on:
+  repository_dispatch:
+    types: [provision-keycloak]
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Récupérer les données du ticket
+        id: data
+        run: |
+          echo "issueKey=${{ github.event.client_payload.issueKey }}"   >> $GITHUB_OUTPUT
+          echo "prenom=${{ github.event.client_payload.prenom }}"       >> $GITHUB_OUTPUT
+          echo "nom=${{ github.event.client_payload.nom }}"             >> $GITHUB_OUTPUT
+          echo "email=${{ github.event.client_payload.email }}"         >> $GITHUB_OUTPUT
+          echo "outils=${{ github.event.client_payload.outils }}"       >> $GITHUB_OUTPUT
+
+      - name: Obtenir un token admin Keycloak
+        id: kc_token
+        run: |
+          TOKEN=$(curl -sf \
+            -d "grant_type=password" \
+            -d "client_id=admin-cli" \
+            -d "username=${{ secrets.KC_ADMIN_USER }}" \
+            -d "password=${{ secrets.KC_ADMIN_PASS }}" \
+            "${{ secrets.KEYCLOAK_BASE_URL }}/realms/PFC/protocol/openid-connect/token" \
+            | jq -r '.access_token')
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Créer l'utilisateur dans Keycloak
+        id: create_user
+        run: |
+          USERNAME=$(echo "${{ steps.data.outputs.email }}" | cut -d'@' -f1 | tr '[:upper:]' '[:lower:]')
+
+          RESPONSE=$(curl -si \
+            -H "Authorization: Bearer ${{ steps.kc_token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "username":        "'"$USERNAME"'",
+              "firstName":       "${{ steps.data.outputs.prenom }}",
+              "lastName":        "${{ steps.data.outputs.nom }}",
+              "email":           "${{ steps.data.outputs.email }}",
+              "enabled":         true,
+              "emailVerified":   false,
+              "requiredActions": ["CONFIGURE_TOTP", "UPDATE_PASSWORD", "VERIFY_EMAIL"],
+              "attributes":      { "locale": ["fr"] }
+            }' \
+            "${{ secrets.KEYCLOAK_BASE_URL }}/admin/realms/PFC/users")
+
+          HTTP_STATUS=$(echo "$RESPONSE" | head -1 | awk '{print $2}')
+
+          if [ "$HTTP_STATUS" = "201" ]; then
+            USER_ID=$(echo "$RESPONSE" | grep -i "^location:" | sed 's|.*/||' | tr -d '\r')
+            echo "userId=$USER_ID" >> $GITHUB_OUTPUT
+            echo "status=created" >> $GITHUB_OUTPUT
+          elif [ "$HTTP_STATUS" = "409" ]; then
+            echo "status=already_exists" >> $GITHUB_OUTPUT
+            echo "::warning::Utilisateur ${{ steps.data.outputs.email }} déjà existant dans Keycloak"
+          else
+            echo "::error::Création user échouée — HTTP $HTTP_STATUS"
+            exit 1
+          fi
+
+      - name: Récupérer les IDs des groupes
+        id: groups
+        if: steps.create_user.outputs.status == 'created'
+        run: |
+          # Récupère tous les groupes du realm
+          ALL_GROUPS=$(curl -sf \
+            -H "Authorization: Bearer ${{ steps.kc_token.outputs.token }}" \
+            "${{ secrets.KEYCLOAK_BASE_URL }}/admin/realms/PFC/groups?max=100")
+
+          # Liste blanche des groupes autorisés
+          GROUPES_AUTORISES="gitlab-developer jenkins-devops nexus-devops sonarcloud-developer"
+
+          # Outils demandés (séparés par virgule depuis Jira)
+          OUTILS="${{ steps.data.outputs.outils }}"
+
+          GROUP_IDS=""
+          GROUPES_ACTIVES=""
+
+          for OUTIL in $(echo "$OUTILS" | tr ',' '\n' | xargs); do
+            # Vérifier que l'outil est dans la liste blanche
+            if echo "$GROUPES_AUTORISES" | grep -qw "$OUTIL"; then
+              ID=$(echo "$ALL_GROUPS" | jq -r --arg name "$OUTIL" '.[] | select(.name==$name) | .id')
+              if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+                GROUP_IDS="$GROUP_IDS $ID"
+                GROUPES_ACTIVES="$GROUPES_ACTIVES $OUTIL"
+              else
+                echo "::warning::Groupe '$OUTIL' introuvable dans Keycloak"
+              fi
+            else
+              echo "::warning::Groupe '$OUTIL' non autorisé — ignoré"
+            fi
+          done
+
+          echo "groupIds=$GROUP_IDS" >> $GITHUB_OUTPUT
+          echo "groupesActives=$GROUPES_ACTIVES" >> $GITHUB_OUTPUT
+
+      - name: Assigner les groupes à l'utilisateur
+        if: steps.create_user.outputs.status == 'created'
+        run: |
+          USER_ID="${{ steps.create_user.outputs.userId }}"
+
+          for GROUP_ID in ${{ steps.groups.outputs.groupIds }}; do
+            HTTP=$(curl -so /dev/null -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: Bearer ${{ steps.kc_token.outputs.token }}" \
+              "${{ secrets.KEYCLOAK_BASE_URL }}/admin/realms/PFC/users/$USER_ID/groups/$GROUP_ID")
+
+            if [ "$HTTP" != "204" ]; then
+              echo "::error::Assignation groupe $GROUP_ID échouée — HTTP $HTTP"
+              exit 1
+            fi
+          done
+
+          echo "Groupes assignés : ${{ steps.groups.outputs.groupesActives }}"
+
+      - name: Envoyer l'email de vérification
+        if: steps.create_user.outputs.status == 'created'
+        run: |
+          curl -sf \
+            -X PUT \
+            -H "Authorization: Bearer ${{ steps.kc_token.outputs.token }}" \
+            "${{ secrets.KEYCLOAK_BASE_URL }}/admin/realms/PFC/users/${{ steps.create_user.outputs.userId }}/send-verify-email" \
+            || echo "::warning::Email de vérification non envoyé (les requiredActions prendront le relais)"
+
+      - name: Commenter le ticket Jira — succès
+        if: steps.create_user.outputs.status == 'created'
+        run: |
+          OUTILS_LISTE=$(echo "${{ steps.groups.outputs.groupesActives }}" | xargs | tr ' ' ', ')
+          curl -sf \
+            -u "${{ secrets.JIRA_USER }}:${{ secrets.JIRA_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "body": {
+                "type": "doc", "version": 1,
+                "content": [{
+                  "type": "paragraph",
+                  "content": [{
+                    "type": "text",
+                    "text": "✅ Compte Keycloak créé.\n\nUtilisateur : ${{ steps.data.outputs.prenom }} ${{ steps.data.outputs.nom }} (${{ steps.data.outputs.email }})\nOutils activés : '"$OUTILS_LISTE"'\n\nUn email a été envoyé pour configurer le mot de passe, le TOTP et vérifier l'\''adresse."
+                  }]
+                }]
+              }
+            }' \
+            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${{ steps.data.outputs.issueKey }}/comment"
+
+      - name: Commenter le ticket Jira — déjà existant
+        if: steps.create_user.outputs.status == 'already_exists'
+        run: |
+          curl -sf \
+            -u "${{ secrets.JIRA_USER }}:${{ secrets.JIRA_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "body": {
+                "type": "doc", "version": 1,
+                "content": [{
+                  "type": "paragraph",
+                  "content": [{"type": "text", "text": "⚠️ Un compte Keycloak existe déjà pour ${{ steps.data.outputs.email }}. Aucune action effectuée."}]
+                }]
+              }
+            }' \
+            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${{ steps.data.outputs.issueKey }}/comment"
+
+      - name: Commenter le ticket Jira — échec
+        if: failure()
+        run: |
+          curl -sf \
+            -u "${{ secrets.JIRA_USER }}:${{ secrets.JIRA_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "body": {
+                "type": "doc", "version": 1,
+                "content": [{
+                  "type": "paragraph",
+                  "content": [{"type": "text", "text": "❌ Échec du provisioning Keycloak. Consulter les logs GitHub Actions : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}]
+                }]
+              }
+            }' \
+            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${{ steps.data.outputs.issueKey }}/comment"
